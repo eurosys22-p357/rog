@@ -1,6 +1,6 @@
 from numpy.lib.histograms import _ravel_and_check_weights
 from torch import tensor
-from torch._C import dtype
+from torch._C import dtype, wait
 from torch.distributed.distributed_c10d import recv
 import socket
 import queue
@@ -8,19 +8,22 @@ import threading
 import pickle
 import multiprocessing as mp
 import time
+
+from torch.optim import optimizer
 from utils import Bar, AverageMeter, accuracy, mkdir_p, savefig
 import torch
 from math import cos, pi
 import torch.distributed as dist
 import numpy as np
 import math
+import operator
+
 MAX_RECV_SIZE=4*1024
-OK_ACK=1000
+MTA=[1,0.5,0.5,0.38197,0.31767,0.27551,0.24512,0.22191,0.203456,0.188348,0.175699]
 class TCPMessageStream:
     NUM_SIZE=4
-    def __init__(self,sock:socket.socket,monitor):
+    def __init__(self,sock:socket.socket):
         self.sock=sock
-        self.monitor=monitor
         self.send_queue=queue.Queue()
         def send_task():
             while True:
@@ -33,8 +36,6 @@ class TCPMessageStream:
         self.recv_queue=queue.Queue()
         def recv_task():
             buffer=bytearray()
-            tail="immediately"
-            tail_bytes=tail.encode("utf-8")
             while True:
                 while len(buffer) < self.NUM_SIZE:
                     buffer +=self.sock.recv(MAX_RECV_SIZE)
@@ -44,10 +45,7 @@ class TCPMessageStream:
                     buffer +=self.sock.recv(MAX_RECV_SIZE)
                 msg =buffer[:msize]
                 buffer=buffer[msize:]
-                if msg[-len(tail_bytes):]==tail_bytes:
-                    self.monitor.put(msg[:-len(tail_bytes)])
-                else:
-                    self.recv_queue.put(msg)
+                self.recv_queue.put(msg)
         self.recv_thread=threading.Thread(target=recv_task)
         self.recv_thread.start()
 
@@ -57,143 +55,91 @@ class TCPMessageStream:
     def recv(self):
         return self.recv_queue.get()
 
-class UDPMessageStream:
-    def __init__(self,sock:socket.socket,congestion_control_min,congestion_control_max,congestion_control,world_size):
-        self.sock=sock
-        self.min=congestion_control_min/100
-        self.max=congestion_control_max/100
-        self.world_size=world_size
-        self.importance_threshold=0.0
-        self.send_queue=queue.Queue()
-        self.address_queue=queue.Queue()
-        def send_task():
-            while True:
-                addr=self.address_queue.get()
-                while not self.send_queue.empty():
-                    msg,importance=self.send_queue.get()
-                    if importance>=self.importance_threshold:
-                        self.sock.sendto(msg,addr)
-                    #print("i send a message to",addr)
-        self.send_thread=threading.Thread(target=send_task)
-        self.send_thread.start()
-
-        self.recv_queue=queue.Queue()
-        def recv_task():    
-            while True:
-                msg,addr=self.sock.recvfrom(MAX_RECV_SIZE)
-                self.recv_queue.put(msg)
-                #print("i get a message")
-        self.recv_thread=threading.Thread(target=recv_task)
-        self.recv_thread.start()
-
-        self.degree=0
-        self.thresholds=[0.0 for _ in range(world_size+1)]
-        def update_task():    
-            while True:
-                self.degree=congestion_control.get()
-                print("udp degree is",self.degree)
-                self.importance_threshold=self.thresholds[self.degree]
-        self.update_thread=threading.Thread(target=update_task)
-        self.update_thread.start()
-
-    def put(self,msg,importance):
-        self.send_queue.put((msg,importance))
-        
-    def recvfrom(self):
-        return self.recv_queue.get()
-    def clean_recv(self):
-        while not self.recv_queue.empty():
-            self.recv_queue.get()
-    def recvfrom_nowait(self):
-        try:
-            return self.recv_queue.get_nowait()
-        except:
-            return None
-    def sendto(self,address,importance):
-        importance.sort()
-        self.thresholds=[importance[0] for _ in range(self.world_size+1)]
-        if self.world_size>1:
-            for i in range(self.world_size):
-                index=self.max-(i/(self.world_size-1)*(self.max-self.min))
-                index=round(len(importance)*(1-index))
-                self.thresholds[i+1]=importance[index]
-        else:
-            index=round(len(importance)*(1-self.min))
-            self.thresholds[1]=importance[index]
-        self.importance_threshold=self.thresholds[self.degree]
-        print("threshold",self.importance_threshold)
-        self.address_queue.put(address)
-
 class layer_unit:
-    def __init__(self,p_idx,threshold,tensor,mtu_number):
-        self.name=p_idx
-        self.threshold=threshold
+    def __init__(self,tensor,mtu_number):
         self.size=tensor.size()
         self.row=[]
-
-        length=tensor.numel()
-        num=math.ceil(length/mtu_number)
-        for i in range(num):
-            start=i*mtu_number
-            if i==num-1:
-                end=length
+        unsuitable=True 
+        for i in range(len(self.size)-1):
+            row_length=1
+            for j in range(i+1,len(self.size)):
+                row_length*=self.size[j]
+            if row_length<mtu_number:
+                row_length=int(mtu_number/row_length)*row_length
+                unsuitable=False
+                break    
+        if unsuitable:
+            if self.size[-1]<mtu_number:
+                row_length=self.size[-1]
             else:
-                end=(i+1)*mtu_number
-            self.row.append((int(start),int(end)))
+                row_length=mtu_number
+        length=tensor.numel()
+        num=int(length/row_length)
+        end=0
+        for i in range(num):
+            start=int(i*row_length)
+            end=int((i+1)*row_length)
+            self.row.append((start,end))
+        if end!=length:
+            self.row.append((end,length))
+        print(self.row)
 
-    def send_model(self,tensor,udpstream:UDPMessageStream,row_states,world_size,importance,training_step):
-        reshaped=tensor.detach().numpy().tobytes()
-        row_states_bytes=row_states.tobytes()
-        layer_idx=self.name.to_bytes(4,"big")
-        rows_id=np.array(range(len(self.row))).tobytes()
+    def select_model(self,tensor,selected,versions,world_size,j):
+        reshaped=tensor.view(-1)
+        transmission_tensor=None
+        transmission_version=None
         for i in range(len(self.row)):
-            important=training_step-min(row_states[i])
-            udpstream.put(reshaped[self.row[i][0]*4:self.row[i][1]*4]+row_states_bytes[i*world_size*8:(i+1)*world_size*8]+rows_id[i*8:(i+1)*8]+layer_idx,important)
-            importance.append(important)
-    def re_send_model(self,tensor,row_states,world_size,send_idx,result):
-        reshaped=tensor.detach().numpy().tobytes()
-        row_states_bytes=row_states.tobytes()
-        layer_idx=self.name.to_bytes(4,"big")
-        rows_id=np.array(range(len(self.row))).tobytes()
-        for i in send_idx:
-            result.append(reshaped[self.row[i][0]*4:self.row[i][1]*4]+row_states_bytes[i*world_size*8:(i+1)*world_size*8]+rows_id[i*8:(i+1)*8]+layer_idx)
-    def start_send(self,udpstream:UDPMessageStream,address,importance):
-        data=pickle.dumps("ok")
-        for _ in range(OK_ACK):
-            udpstream.put(data,float("inf"))
-        udpstream.sendto(address,importance)
-        print("send ok")
-    def send_gradient(self,tensor,udpstream:UDPMessageStream,remain_number,importance,row_states,training_step):
-        reshaped=tensor.detach().numpy().tobytes()
-        one_dim=tensor.view(-1)
-        remain_number_bytes=remain_number.tobytes()
-        layer_idx=self.name.to_bytes(4,"big")
-        rows_id=np.array(range(len(self.row))).tobytes()
+            if selected[i]==True:
+                tag=reshaped[self.row[i][0]:self.row[i][1]]
+                this_version=torch.zeros(2+world_size)
+                this_version[0]=j
+                this_version[1]=i
+                this_version[2:]=versions[i]
+                if transmission_tensor==None:
+                    transmission_tensor=tag
+                    transmission_version=this_version
+                else:
+                    transmission_tensor=torch.cat((transmission_tensor,tag),0)
+                    transmission_version=torch.cat((transmission_version,this_version),0)
+        return transmission_tensor,transmission_version
+    def select_gradients(self,tensor,selected,versions,j):
+        reshaped=tensor.view(-1)
+        transmission_tensor=None
+        transmission_version=None
         for i in range(len(self.row)):
-            important=torch.sum(torch.abs(one_dim[self.row[i][0]:self.row[i][1]])).item()
-            if training_step ==min(row_states[i])+self.threshold+1:
-                important=float("inf")
-                print("**********",training_step,row_states[i])
-            udpstream.put(reshaped[self.row[i][0]*4:self.row[i][1]*4]+remain_number_bytes[i*8:(i+1)*8] +rows_id[i*8:(i+1)*8]+layer_idx,important)
-            importance.append(important)
+            if selected[i]==True:
+                tag=reshaped[self.row[i][0]:self.row[i][1]]
+                this_version=torch.zeros(3)
+                this_version[0]=j
+                this_version[1]=i
+                this_version[2]=versions[i]
+                if transmission_tensor==None:
+                    transmission_tensor=tag
+                    transmission_version=this_version
+                else:
+                    transmission_tensor=torch.cat((transmission_tensor,tag),0)
+                    transmission_version=torch.cat((transmission_version,this_version),0)
+        return transmission_tensor,transmission_version
     
         
 class Parameter_Server:
-    def __init__(self,ps_ip,ps_port,world_size,threshold_min,threshold_max,model,optimizer,communication_library,MTU,congestion_control_min,congestion_control_max):
+    def __init__(self,ps_ip,ps_port,world_size,threshold,model,optimizer,communication_library,MTU):
         self.world_size=world_size
         self.model=model
+        self.threshold=threshold
+        
         self.gathered_weight=mp.Queue(maxsize=1000)
+        self.updated_by_others=mp.Queue(maxsize=10)
         self.lock=threading.Lock()
         self.training_step=[0 for _ in range(world_size)]
-        self.min_step=mp.Queue(maxsize=world_size)
         self.communication_library=communication_library
         self.mtu_number=MTU/4
+        self.throught=[0 for _ in range(world_size)]
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((ps_ip, ps_port))
         sock.listen(world_size)
-        self.connection=0
 
         self.layer_info=[]
         layers=0
@@ -202,198 +148,145 @@ class Parameter_Server:
         layer=0
         for p_idx,p in enumerate(self.model.parameters()):
             layer+=1
-            threshold=round(threshold_min+(threshold_max-threshold_min)*(layer/layers))
-            self.layer_info.append(layer_unit(p_idx,threshold,p,self.mtu_number))
+            self.layer_info.append(layer_unit(p,self.mtu_number))
             assert p.dtype==torch.float32
         self.row_states=[]
-        self.row_number=0
+        self.row_importance=[]
         for i in range(len(self.layer_info)):
             rows=[]
-            self.row_number+=len(self.layer_info[i].row)
             for _ in range(len(self.layer_info[i].row)):
                 rows.append([0 for _ in range(world_size)])
             self.row_states.append(np.array(rows))
+            self.row_importance.append(np.array([0 for _ in range(len(self.layer_info[i].row))]))
 
         proc=[]
+        self.finish=[False for _ in range(self.world_size)]
+        self.allfinish=mp.Queue(maxsize=10)
         self.isupdated=[]
-        self.broadcast=[]
         for _ in range(world_size):
             self.isupdated.append(mp.Queue(maxsize=10))
-            self.broadcast.append(mp.Queue(maxsize=10))
         t=threading.Thread(target=self.parameter_server_optimizer,args=(optimizer,))
         proc.append(t)
        
         for i in range(world_size):
-            client_sock, client_address = sock.accept()
-            immediately_queue=mp.Queue()
-            client_stream=TCPMessageStream(client_sock,immediately_queue)
-            t=threading.Thread(target=self.each_parameter_server,args=(client_stream,client_address,ps_ip,ps_port,i,immediately_queue,congestion_control_min,congestion_control_max))
+            client_sock, _ = sock.accept()
+            client_stream=TCPMessageStream(client_sock)
+            t=threading.Thread(target=self.each_parameter_server,args=(client_stream,ps_ip,ps_port,i))
             proc.append(t)
         for t in proc:
             t.start()
         print("start parameter server",flush=True)
-    
-    def each_parameter_server(self,client_stream:TCPMessageStream,client_address,ps_ip,ps_port,rank,immediately_queue,congestion_control_min,congestion_control_max):
-        congestion_control=mp.Queue(maxsize=1)
-        udp_sock=socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        udp_sock.bind((ps_ip, ps_port+1+rank))
-        udp_stream=UDPMessageStream(udp_sock,congestion_control_min,congestion_control_max,congestion_control,self.world_size)
-        client_udp_address=[]
-        client_udp_address.append(client_address[0])
-        client_udp_address.append(client_address[1]+1)
-        client_udp_address=tuple(client_udp_address)
-        
-        
-        def background_task(immediately_queue):
-            while True:
-                msg=pickle.loads(immediately_queue.get())
-        background_thread=threading.Thread(target=background_task,args=(immediately_queue,))
-        background_thread.start()
-    
-        def broadcast_task():
-            tail="immediately"
-            tail_bytes=tail.encode("utf-8")
-            while True:
-                msg=self.broadcast[rank].get()
-                if msg=="congestion":
-                    client_stream.send(pickle.dumps("congestion"+str(self.connection))+tail_bytes)
-                if msg=="ask for new":
-                    ask_for_new=self.broadcast[rank].get()
-                    print("ask for new")
-                    client_stream.send(pickle.dumps("ask for new")+tail_bytes)
-                    client_stream.send(pickle.dumps(ask_for_new)+tail_bytes)
-
-        broadcast_thread=threading.Thread(target=broadcast_task)
-        broadcast_thread.start()
-
+    def select_model(self,transmission_rate,iteration):
+        selected=[]
+        importance=np.array([])
+        for i in range(len(self.layer_info)):
+            importance=np.concatenate((importance,self.row_importance[i]*(-1)+iteration),0)
+        threshold=sorted(importance)[int(len(importance)*transmission_rate)]
+        total=0
+        count=0
+        for i in range(len(self.layer_info)):
+            tag2=len(self.layer_info[i].row)
+            total+=tag2
+            tag=[False for _ in range(tag2)]
+            for j in range(tag2):
+                if self.row_importance[i][j]>threshold:
+                    tag[j]=True
+                    count+=1
+            selected.append(tag)
+        if transmission_rate- count/total>1e-3:
+            finish=False
+            for i in range(len(self.layer_info)):
+                for j in range(len(self.layer_info[i].row)):
+                    if self.row_importance[i][j]==threshold:
+                        selected[i][j]=True
+                        count+=1
+                    if transmission_rate- count/total<1e-3:
+                        finish=True
+                        break
+                if finish:
+                    break 
+        print(f"transmission rate:{transmission_rate}, actually:{count/total}",flush=True)          
+        return selected
+    def each_parameter_server(self,client_stream:TCPMessageStream,ps_ip,ps_port,rank):
         while True:
             msg=pickle.loads(client_stream.recv())
             print(msg)
             if msg=='get':
-                client_stream.send(pickle.dumps((self.model,self.layer_info,(ps_ip, ps_port+1+rank))))
-            if msg=='ask':
-                self.connection+=1
-                congestion_control.put(self.connection)
-                for i in range(self.world_size):
-                    self.broadcast[i].put("congestion")
-                if self.communication_library=="gloo":
-                    srcrank=pickle.loads(client_stream.recv())
-                    for p in self.model.parameters():
-                        dist.send(p,srcrank)
-                if self.communication_library=="tcp":
-                    client_stream.send(pickle.dumps(self.model))
-                if self.communication_library=="rog":
-                    importance=[]
-                    for i,p in enumerate(self.model.parameters()):
-                        self.layer_info[i].send_model(p,udp_stream,self.row_states[i],self.world_size,importance,self.training_step[rank])
-                    self.layer_info[i].start_send(udp_stream,client_udp_address,importance)
-                self.connection-=1
-                congestion_control.put(self.connection)
-                for i in range(self.world_size):
-                    self.broadcast[i].put("congestion")
-            if msg=='send':
-                self.connection+=1
-                congestion_control.put(self.connection)
-                for i in range(self.world_size):
-                    self.broadcast[i].put("congestion")
+                client_stream.send(pickle.dumps((self.model,self.layer_info)))
+            if msg[:3]=='thr':
+                self.throught[rank]=float(msg[8:])
+            if msg[:3]=='ask':
+                selected=self.select_model(MTA[self.threshold]*self.throught[rank]/min(self.throught),self.training_step[rank])
+                transmission_tensor=None
+                transmission_versions=None
+                for i,p in enumerate(self.model.parameters()):
+                    selected_tensor,selected_verisons=self.layer_info[i].select_model(p,selected[i],self.row_states[i],self.world_size,i)
+                    if transmission_tensor==None:
+                        transmission_tensor=selected_tensor
+                        transmission_versions=selected_verisons
+                    else:
+                        transmission_tensor=torch.cat((transmission_tensor,selected_tensor),0)
+                        transmission_versions=torch.cat((transmission_versions,selected_verisons),0)
+                srcrank=int(msg[3:])
+                client_stream.send(pickle.dumps([transmission_versions.numel(),transmission_tensor.numel()]))
+                dist.send(transmission_versions,srcrank)
+                dist.send(transmission_tensor,srcrank)
+            if msg[:3]=='sen':
+                client_stream.send(pickle.dumps(MTA[self.threshold]*self.throught[rank]/min(self.throught)))
                 with self.lock:
                     self.training_step[rank]+=1
-                if self.communication_library=="gloo":
-                    lr=pickle.loads(client_stream.recv())
-                    weight=[]
-                    for p in self.model.parameters():
-                        recv_tensor=torch.ones_like(p)
-                        dist.recv(recv_tensor,srcrank)
-                        weight.append(recv_tensor)
-                    success="ok"
-                if self.communication_library=="tcp":
-                    weight,lr=pickle.loads(client_stream.recv())
-                    success="ok"
-                if self.communication_library=="rog":
-                    lr=pickle.loads(client_stream.recv())
-                    result=[]
-                    udp_stream.clean_recv()
-                    far_away_end=True
-                    while True:
-                        if far_away_end:
-                            data=udp_stream.recvfrom()
-                            if len(data)==12:
-                                print(pickle.loads(data))
-                                far_away_end=False
-                                continue
-                        else:
-                            data=udp_stream.recvfrom_nowait()
-                            if data==None:
-                                break
-                            if len(data)==12:
-                                far_away_end=False
-                                continue
-                        result.append(data)
-                    weight,success=self.gather_gradient(result)
+                lr=float(msg[3:])
+                selected=pickle.loads(client_stream.recv())
+                weight=self.gather_gradient(selected)
                 self.gathered_weight.put((weight,lr,rank))
                 msg=self.isupdated[rank].get()
                 assert msg=="ok"
-                client_stream.send(pickle.dumps(success))
-                self.connection-=1
-                congestion_control.put(self.connection)
-                for i in range(self.world_size):
-                    self.broadcast[i].put("congestion")
+                client_stream.send(pickle.dumps("ok"))
+                while not self.updated_by_others.empty():
+                    try:
+                        self.updated_by_others.get_nowait()
+                    except:
+                        break
             if msg=="finish":
                 with self.lock:
-                    myself=self.training_step[rank]
-                    now=min(self.training_step)
-                while now!=0 and myself!=now:
-                    now=self.min_step.get()
+                    self.finish[rank]=True
+                    condition=all(self.finish)
+                if condition:
+                    for _ in range(self.world_size-1):
+                        self.allfinish.put("ok")
+                else:
+                    self.allfinish.get()
                 self.training_step[rank]=0
+                for i in range(len(self.layer_info)):
+                    for j in range(len(self.layer_info[i].row)):
+                        for k in range(self.world_size):
+                            self.row_states[i][j][k]=0
                 client_stream.send(pickle.dumps("ok"))
-            if msg=='need update':
-                need_updates=pickle.loads(client_stream.recv())
-                stall=[]
-                ask_for_new=[]
-                unsent=[]
-                for need_update in need_updates:
-                    i,j,min_step=need_update
-                    if min(self.training_step)<min_step:
-                        stall.append(need_update)
-                    else:
-                        if min(self.row_states[i][j])<min_step:
-                            ask_for_new.append(need_update)
-                        else:
-                            unsent.append(need_update)
-                print("stall",len(stall))
-                print("ask for new",len(ask_for_new))
-                print("unsent",len(unsent))
-                result=[]
-                idx=0
+            if msg[:3]=='nee':
+                length=int(msg[3:])
+                recv_tensor=torch.tensor([0 for _ in range(length)])
+                dist.recv(recv_tensor,srcrank)
+                selected=[]
+                for i in range(self.layer_info):
+                    selected.append([False for _ in range(len(self.layer_info[i].row))])
+                for i in range(length/3):
+                    selected[recv_tensor[i*3]][recv_tensor[i*3+1]]=True
+                    min_step=min(self.row_states[recv_tensor[i*3]][recv_tensor[i*3+1]])
+                    while recv_tensor[3*i+2]>min_step+self.threshold:
+                        self.updated_by_others.get()
+                transmission_tensor=None
+                transmission_versions=None
                 for i,p in enumerate(self.model.parameters()):
-                    send_idx=[]
-                    while idx<len(unsent) and unsent[idx][0]==i:
-                        send_idx.append(unsent[idx][1])
-                        idx+=1
-                    self.layer_info[i].re_send_model(p,self.row_states[i],self.world_size,send_idx,result)
-                requirement=[[] for _ in range(self.world_size)]
-                for each in ask_for_new:
-                    threshold=self.layer_info[each[0]].threshold
-                    iteration=each[2]
-                    for i in range(self.world_size):
-                        if self.row_states[each[0]][each[1]][i]+threshold<iteration:
-                            requirement[i].append(each)
-                for each in stall:
-                    threshold=self.layer_info[each[0]].threshold
-                    iteration=each[2]
-                    for i in range(self.world_size):
-                        if self.row_states[each[0]][each[1]][i]+threshold<iteration:
-                            requirement[i].append(each)
-                for i in range(self.world_size):
-                    self.broadcast[i].put("ask for new")
-                    self.broadcast[i].put(requirement[i])
-                client_stream.send(pickle.dumps())
-                result.append(pickle.loads(client_stream.recv()))
-
-                print("send:",len(result))
-                client_stream.send(pickle.dumps(result))
-
+                    selected_tensor,selected_verisons=self.layer_info[i].select_model(p,selected[i],self.row_states[i],self.world_size,i)
+                    if transmission_tensor==None:
+                        transmission_tensor=selected_tensor
+                        transmission_versions=selected_verisons
+                    else:
+                        transmission_tensor=torch.cat((transmission_tensor,selected_tensor),0)
+                        transmission_versions=torch.cat((transmission_versions,selected_verisons),0)
+                client_stream.send(pickle.dumps([transmission_versions.numel(),transmission_tensor.numel()]))
+                dist.send(transmission_versions,srcrank)
+                dist.send(transmission_tensor,srcrank)
 
 
 
@@ -407,40 +300,39 @@ class Parameter_Server:
             optimizer.step()
             optimizer.zero_grad()
             self.isupdated[rank].put("ok")
-    def gather_gradient(self,result):
+    
+    def gather_gradient(self,selected):
         weight=[]
-        success=[]
-        each_layer=[[] for _ in range(len(self.layer_info))]
-        for each_data in result:
-            rank=int.from_bytes(each_data[-4:],"big")
-            each_layer[rank].append(each_data)
+        srcrank=selected[0]
+        recv_numbers=torch.tensor([0 for _ in range(selected[1])])
+        dist.recv(recv_numbers,srcrank)
+        recv_gradients=torch.tensor([0 for _ in range(selected[2])])
+        dist.recv(recv_gradients,srcrank)  
+        idx=0
+        offset=0
+        weight=[]
         for i,p in enumerate(self.model.parameters()):
-            reshaped=torch.zeros_like(p.view(-1))
-            this_layer=self.layer_info[i]
-            for each_row in each_layer[i]:
-                idx=np.frombuffer(each_row[-12:-4],dtype=int)[0]
-                remain_number=np.frombuffer(each_row[-20:-12],dtype=int)
-                reshaped.data[this_layer.row[idx][0]:this_layer.row[idx][1]]=reshaped.data[this_layer.row[idx][0]:this_layer.row[idx][1]]+torch.tensor(np.frombuffer(each_row[:-20],dtype=np.float32))
-                self.row_states[i][idx]+=remain_number
-                success.append((i,idx))
-            weight.append(reshaped.view(self.layer_info[i].size))
-        print(f"recvice row number: {len(result)} {self.row_number} {len(result)/self.row_number*100}")
-        return weight,success   
+            this_layer_gradients=torch.zeros_like(p).view(-1)
+            while recv_numbers[idx]==i:
+                row_idx=recv_numbers[idx+1]
+                self.row_states[i][row_idx][srcrank]+=recv_numbers[idx+2]
+                start=self.layer_info[i].rows[row_idx][0]
+                end=self.layer_info[i].rows[row_idx][1]
+                this_layer_gradients[start:end]=recv_gradients[offset:offset+end-start]
+                self.row_importance[i][row_idx]=min(self.row_states[i][row_idx])
+                offset+=end-start
+                idx+=3
+            weight.append(this_layer_gradients.reshape(p.size()))
+        return weight
 
 class Local_Worker:
-    def __init__(self,args,model,ps_ip,ps_port,train_loader, train_loader_len,val_loader, val_loader_len, criterion,lr,communication_library):
+    def __init__(self,args,model,ps_ip,ps_port,train_loader, train_loader_len,val_loader, val_loader_len, criterion,optimizer,communication_library):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         time.sleep(1) # waiting for ps start
         sock.connect((ps_ip, ps_port))
         self.immediately_queue=mp.Queue()
         self.sock = TCPMessageStream(sock,self.immediately_queue)
         print("conneted to parameter server", flush=True)
-        udp_sock=socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        udp_sock.bind((sock.getsockname()[0], sock.getsockname()[1]+1))
-        self.congestion_degree=0
-        self.congestion_control=mp.Queue(maxsize=1)
-        self.udpsock=UDPMessageStream(udp_sock,args.congestion_control_min,args.congestion_control_max,self.congestion_control,args.world_size-1)
         
         
         self.args=args
@@ -450,132 +342,176 @@ class Local_Worker:
         self.train_loader_len=train_loader_len
         self.val_loader=val_loader
         self.val_loader_len=val_loader_len
-        self.lr=lr
+        self.lr=args.lr
+        self.optimizer=optimizer
         self.communication_library=communication_library
+        self.world_size=args.world_size-1
+        self.threshold=args.threshold
 
-        def background_task():
+        def listen_bandwidth():
+            interval=0.5
+            dev =open("/proc/net/dev","r")
+            lines=dev.readlines()
+            count=0
+            for line in lines[2:]:
+                intf=line[:line.index(":")].strip()
+                if operator.eq(intf[:2],'wl'):
+                    count+=1
+            assert count==1
+            values={}
+            transmit=0
             while True:
-                msg=pickle.loads(self.immediately_queue.get())
-                if msg[:10]=="congestion":
-                    self.congestion_degree=int(msg[10:])
-                    self.congestion_control.put(self.congestion_degree)
-                if msg=="stall":
-                    self.push_update()
-                if msg=="ask for new":
-                    self.push_update()
-        self.background_thread=threading.Thread(target=background_task)
-        self.background_thread.start()
+                dev.seek(0)
+                lines=dev.readlines()
+                for line in lines[2:]:
+                    intf=line[:line.index(":")].strip()
+                    if operator.ne(intf[:2],'wl'):
+                        continue
+                    values[intf]=[int(value) for value in line[line.index(":")+1:].split()]
+                    new=values[intf][8]
+                    self.sock.send(pickle.dumps("thr"+str((new-transmit)/interval*8/1024/1024)))
+                    transmit=new
+                    break
+                time.sleep(interval)
+        self.listen_thread=threading.Thread(listen_bandwidth)
+        self.listen_thread.start()
+
         
-    def update_model(self,data):
-        each_layer=[[] for _ in range(len(self.layer_info))]
-        for each_data in data:
-            rank=int.from_bytes(each_data[-4:],"big")
-            each_layer[rank].append(each_data)
+    def update_model(self,recv_tensor,recv_versions):
+        idx=0
+        offset=0
+        rank=dist.get_rank()
         for i,p in enumerate(self.model.parameters()):
-            reshaped=p.view(-1)
-            this_layer=self.layer_info[i]
-            for each_row in each_layer[i]:
-                idx=np.frombuffer(each_row[-12:-4],dtype=int)[0]
-                states=np.frombuffer(each_row[-12-(self.args.world_size-1)*8:-12],dtype=int)
-                self.row_states[i][idx]=states
-                reshaped.data[this_layer.row[idx][0]:this_layer.row[idx][1]]=torch.tensor(np.frombuffer(each_row[:-12-(self.args.world_size-1)*8],dtype=np.float32))
-        print(f"recvice row number: {len(data)} {self.row_number} {len(data)/self.row_number*100}")
+            this_layer_model=p.view(-1)
+            for j in range(len(self.layer_info[i])):
+                self.row_states[i][j][rank]+=1
+            while recv_versions[idx]==i:
+                row_idx=recv_versions[idx+1]
+                self.row_states[i][row_idx]=recv_versions[idx+2:idx+2+self.world_size]
+                start=self.layer_info[i].rows[row_idx][0]
+                end=self.layer_info[i].rows[row_idx][1]
+                this_layer_model[start:end]=recv_tensor[offset:offset+end-start]
+                offset+=end-start
+                idx+=2+self.world_size
+       
     def check_threshold(self,iteration):
         print("check for threshold") 
         waiting_for_new=[]
+        threshold=self.args.threshold
         for i in range(len(self.row_states)):
-            threshold=self.layer_info[i].threshold
             for j in range(len(self.row_states[i])):
                 min_step=min(self.row_states[i][j])
                 if iteration>min_step+threshold:
                     waiting_for_new.append((i,j,iteration))
         if waiting_for_new!=[]:
-            self.sock.send(pickle.dumps("need update"))
-            self.sock.send(pickle.dumps(waiting_for_new))
-            result=pickle.loads(self.sock.recv())
-            self.update_model(result)
+            self.sock.send(pickle.dumps("nee"+str(3*len(waiting_for_new))))
+            send_tensor=torch.tensor([0 for _ in range(3*len(waiting_for_new))])
+            for i in range(len(waiting_for_new)):
+                send_tensor[3*i]=waiting_for_new[i][0]
+                send_tensor[3*i+1]=waiting_for_new[i][1]
+                send_tensor[3*i+2]=waiting_for_new[i][2]
+            dist.send(send_tensor,0)
+            recv_lengths=pickle.loads(self.sock.recv())
+            recv_versions=torch.zeros(recv_lengths[0])
+            recv_tensor=torch.zeros(recv_lengths[0])
+            dist.recv(recv_versions,0)
+            dist.recv(recv_tensor,0)
+            self.update_model(recv_tensor,recv_versions)
             self.check_threshold(iteration)
         print("pass check threshold")
                
     def pull_model(self,iteration):
         print("start ask for new model",flush=True)
-        
-        self.sock.send(pickle.dumps("ask"))
-        if self.communication_library=="gloo":
-            start=time.time()
-            self.sock.send(pickle.dumps(dist.get_rank()))
-            for p in self.model.parameters():
-                dist.recv(p,0)
-            end=time.time()
-        if self.communication_library=="tcp":
-            start=time.time()
-            self.model=pickle.loads(self.sock.recv())
-            end=time.time()
-        if self.communication_library=="rog":
-            far_away_end=True
-            self.udpsock.clean_recv()
-            result=[]
-            start=time.time()
-            while True:
-                if far_away_end:
-                    data=self.udpsock.recvfrom()
-                    if len(data)==12:
-                        print(pickle.loads(data))
-                        far_away_end=False
-                        continue
-                else:
-                    data=self.udpsock.recvfrom_nowait()
-                    if data==None:
-                        break
-                    if len(data)==12:
-                        far_away_end=False
-                        continue
-                result.append(data)
-            end=time.time()
-            self.update_model(result)
+        self.sock.send(pickle.dumps("ask"+str(dist.get_rank())))
+        start=time.time()
+        self.optimizer.step()
+        recv_lengths=pickle.loads(self.sock.recv())
+        recv_versions=torch.zeros(recv_lengths[0])
+        recv_tensor=torch.zeros(recv_lengths[0])
+        dist.recv(recv_versions,0)
+        dist.recv(recv_tensor,0)
+        end=time.time()
+        self.update_model(recv_tensor,recv_versions)
         self.check_threshold(iteration)
         self.model.train()
         print("complete",end-start,flush=True)
         return end-start
+    def select_gradients(self,transmission_rate,iteration):
+        for i,p in enumerate(len(self.remain)):
+            this_layer_gradient=self.remain.view(-1)
+            for j in range(self.layer_info[i].row):
+                start=self.layer_info[i].row[j][0]
+                end=self.layer_info[i].row[j][0]
+                min_step=min(self.row_states[i][j])
+                factor=iteration-min_step
+                if iteration>min_step+self.threshold:
+                    factor=float("inf")
+                self.row_importance[i][j]=torch.sum(torch.abs(this_layer_gradient[self.row[i][0]:self.row[i][1]])).item()*factor
+
+        selected=[]
+        importance=np.array([])
+        for i in range(len(self.layer_info)):
+            importance=np.concatenate((importance,self.row_importance[i]),0)
+        threshold=sorted(importance)[int(len(importance)*transmission_rate)]
+        total=0
+        count=0
+        for i in range(len(self.layer_info)):
+            tag2=len(self.layer_info[i].row)
+            total+=tag2
+            tag=[False for _ in range(tag2)]
+            for j in range(tag2):
+                if self.row_importance[i][j]>threshold:
+                    tag[j]=True
+                    count+=1
+            selected.append(tag)
+        if transmission_rate- count/total>1e-3:
+            finish=False
+            for i in range(len(self.layer_info)):
+                for j in range(len(self.layer_info[i].row)):
+                    if self.row_importance[i][j]==threshold:
+                        selected[i][j]=True
+                        count+=1
+                    if transmission_rate- count/total<1e-3:
+                        finish=True
+                        break
+                if finish:
+                    break 
+        print(f"transmission rate:{transmission_rate}, actually:{count/total}",flush=True)          
+        return selected
     def push_update(self,iteration):
         print("start push update",flush=True)
-        if self.communication_library=="gloo" or self.communication_library=="tcp":
-            weight=[]
-            for p in self.model.parameters():
-                weight.append(p.grad.detach())
         start=time.time()
-        self.sock.send(pickle.dumps("send"))
-        if self.communication_library=="gloo":
-            self.sock.send(pickle.dumps(self.lr))
-            for p in self.model.parameters():
-                dist.send(p.grad.detach(), 0)
-        if self.communication_library == "tcp":
-            self.sock.send(pickle.dumps((weight, self.lr)))
-        if self.communication_library=="rog":
-            self.sock.send(pickle.dumps(self.lr))
-            importance=[]
-            for i,p in enumerate(self.model.parameters()):
-                self.remain[i].data=self.remain[i].data+p.grad
-                self.remain_number[i]+=1
-                self.layer_info[i].send_gradient(self.remain[i],self.udpsock,self.remain_number[i],importance,self.row_states[i],iteration)
-            self.layer_info[i].start_send(self.udpsock,self.udpaddress,importance)
-        results = pickle.loads(self.sock.recv())
-        for success in results:
-            layer_idx=success[0]
-            row_idx=success[1]
-            p=self.remain[layer_idx]
-            p.data[self.layer_info[layer_idx].row[row_idx][0]:self.layer_info[layer_idx].row[row_idx][1]]=torch.zeros_like(p[self.layer_info[layer_idx].row[row_idx][0]:self.layer_info[layer_idx].row[row_idx][1]])
-            self.remain_number[layer_idx][row_idx]=0
-
-
-
+        self.sock.send(pickle.dumps("sen"+str(self.lr)))
+        transmission_rate=pickle.loads(self.sock.recv())
+        selected=self.select_gradients(transmission_rate)
+        transmission_gradients=None
+        transmission_numbers=None
+        for i,p in enumerate(self.model.parameters()):
+            selected_gradients,selected_numbers=self.layer_info[i].select_gradients(p,selected[i],self.remain_number[i],i)
+            if transmission_gradients==None:
+                transmission_gradients=selected_gradients
+                transmission_numbers=selected_numbers
+            else:
+                transmission_gradients=torch.cat((transmission_gradients,selected_gradients),0)
+                transmission_numbers=torch.cat((transmission_numbers,selected_numbers),0)
+        self.sock.send(pickle.dumps([dist.get_rank(),transmission_numbers.numel(),transmission_gradients.numel()]))
+        dist.send(transmission_numbers,0)
+        dist.send(transmission_gradients,0)
         end = time.time()
+        for i in range(len(selected)):
+            for j in range(len(selected[i][j])):
+                if selected[i][j]==False:
+                    continue
+                p=self.remain[i]
+                p.data[self.layer_info[i].row[j][0]:self.layer_info[i].row[j][1]]=torch.zeros_like(p[self.layer_info[i].row[j][0]:self.layer_info[i].row[j][1]])
+                self.remain_number[i][j]=0
+                self.row_importance[i][j]=0
         print("complete",flush=True)
         return end - start
         
     def get_model(self):
         self.sock.send(pickle.dumps("get"))
-        self.model,self.layer_info,self.udpaddress=pickle.loads(self.sock.recv())
+        self.model,self.layer_info=pickle.loads(self.sock.recv())
         self.model.train()
         self.row_states=[]
         self.row_number=0
@@ -587,10 +523,11 @@ class Local_Worker:
             self.row_states.append(np.array(rows))
         self.remain=[]
         self.remain_number=[]
+        self.row_importance=[]
         for i,p in enumerate(self.model.parameters()):
             self.remain.append(torch.zeros_like(p))
             self.remain_number.append(np.array([0 for _ in range(len(self.layer_info[i].row))]))
-
+            self.row_importance.append(np.array([0 for _ in range(len(self.layer_info[i].row))]))
         print("get new model")
     def train(self, epoch, start_time):
         bar = Bar('Processing', max=self.train_loader_len)
@@ -622,7 +559,7 @@ class Local_Worker:
             loss = self.criterion(output, target)
 
             # compute gradient and do SGD step
-            
+            self.optimizer.zero_grad()
             loss.backward()
             end1 = time.time()
             if (self.args.fix-end1+start>0):
@@ -632,8 +569,6 @@ class Local_Worker:
             print("network waiting time ", pull_model_time + push_update_time)
             print("local computation time ", end1 - start)
             print("fix computation time ", end2 - start)
-            for p in self.model.parameters():
-                p.grad = torch.zeros_like(p.grad)
             # measure elapsed time
             # measure accuracy and record loss
             prec1, prec5 = accuracy(output, target, topk=(1, 5))

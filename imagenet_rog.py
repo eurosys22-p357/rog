@@ -111,21 +111,14 @@ parser.add_argument('--width-mult', type=float, default=1.0, help='MobileNet mod
 parser.add_argument('--input-size', type=int, default=224, help='MobileNet model input resolution')
 parser.add_argument('--weight', default='', type=str, metavar='WEIGHT',
                     help='path to pretrained weight (default: none)')
-parser.add_argument('--threshold_min', default=0, type=int, metavar='threshold_min',
-                    help='staleness threshold')
-parser.add_argument('--threshold_max', default=0, type=int, metavar='threshold_max',
-                    help='staleness threshold')
-parser.add_argument('--congestion_control_min', default=60.0, type=int, metavar='congestion_control_min',
-                    help='staleness threshold')
-parser.add_argument('--congestion_control_max', default=100.0, type=int, metavar='congestion_control_max',
+parser.add_argument('--threshold', default=2, type=int, metavar='threshold',
                     help='staleness threshold')
 parser.add_argument('--fix', default=0.0, type=float, metavar='fix',
                     help='fix time')
 best_prec1 = 0
 ps_ip = "localhost"
 ps_port = 12333
-validate_frequence=100
-MTU=1450
+MTU=1500
 def main():
     global args, best_prec1
     args = parser.parse_args()
@@ -149,6 +142,9 @@ def main():
     print(args.arch)
     # model = models.__dict__[args.arch](width_mult=args.width_mult)
     model = models.__dict__[args.arch]()
+    optimizer = torch.optim.SGD(model.parameters(), args.lr,
+                                    momentum=args.momentum,
+                                    weight_decay=args.weight_decay)
     if args.rank==0:
         # create model
         
@@ -167,9 +163,7 @@ def main():
         # define loss function (criterion) and optimizer
         #criterion = nn.CrossEntropyLoss().cuda()
 
-        optimizer = torch.optim.SGD(model.parameters(), args.lr,
-                                    momentum=args.momentum,
-                                    weight_decay=args.weight_decay)
+       
         
         # optionally resume from a checkpoint
         title = 'ImageNet-' + args.arch
@@ -233,10 +227,10 @@ def main():
     # writer = SummaryWriter(os.path.join(args.checkpoint, 'logs'))
     communication_library="rog"
     if args.rank==0:
-        parameter_server=Parameter_Server(ps_ip,ps_port,args.world_size-1,args.threshold_min,args.threshold_max,model,optimizer,communication_library,MTU,args.congestion_control_min,args.congestion_control_max)
+        parameter_server=Parameter_Server(ps_ip,ps_port,args.world_size-1,args.threshold,model,optimizer,communication_library,MTU)
     else:
         criterion = nn.CrossEntropyLoss()
-        local_worker=Local_Worker(args,model,ps_ip,ps_port,train_loader, train_loader_len,val_loader, val_loader_len ,criterion,args.lr,communication_library)
+        local_worker=Local_Worker(args,model,ps_ip,ps_port,train_loader, train_loader_len,val_loader, val_loader_len ,criterion,optimizer,communication_library)
 
     if args.rank!=0:
         start_time = time.time()
